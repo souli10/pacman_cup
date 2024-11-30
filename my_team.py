@@ -1,5 +1,5 @@
-# baseline_team.py
-# ---------------
+# myTeam.py
+# ---------
 # Licensing Information:  You are free to use or extend these projects for
 # educational purposes provided that (1) you do not distribute or publish
 # solutions, (2) you retain this notice, and (3) you provide clear
@@ -12,469 +12,278 @@
 # Pieter Abbeel (pabbeel@cs.berkeley.edu).
 
 
-# baseline_team.py
-# ---------------
-# Licensing Information: Please do not distribute or publish solutions to this
-# project. You are free to use and extend these projects for educational
-# purposes. The Pacman AI projects were developed at UC Berkeley, primarily by
-# John DeNero (denero@cs.berkeley.edu) and Dan Klein (klein@cs.berkeley.edu).
-# For more info, see http://inst.eecs.berkeley.edu/~cs188/sp09/pacman.html
-
 import random
-import contest.util as util
-from random import randint
 from contest.capture_agents import CaptureAgent
 from contest.game import Directions, Actions
-from contest.util import nearest_point
+from contest.util import nearest_point, PriorityQueue
 
+
+#################
+# Team creation #
+#################
+
+def create_team(first_index, second_index, is_red,
+                first='OffensiveDefensiveAgentNORTH', second='OffensiveDefensiveAgentSOUTH', num_training=0):
+    """
+    This function should return a list of two agents that will form the
+    team, initialized using firstIndex and secondIndex as their agent
+    index numbers.  isRed is True if the red team is being created, and
+    will be False if the blue team is being created.
+
+    As a potentially helpful development aid, this function can take
+    additional string-valued keyword arguments ("first" and "second" are
+    such arguments in the case of this function), which will come from
+    the --redOpts and --blueOpts command-line arguments to capture.py.
+    For the nightly contest, however, your team will be created without
+    any extra arguments, so you should make sure that the default
+    behavior is what you want for the nightly contest.
+    """
+    SharedState.reset() # Initialize the shard state
+
+    # The following line is an example only; feel free to change it.
+    return [eval(first)(first_index), eval(second)(second_index)]
+
+
+##########
+# Agents #
+##########
+
+# North agent - focuses on upper half of map
+class OffensiveDefensiveAgentNORTH(CaptureAgent):
+    def register_initial_state(self, game_state):
+        # Store starting position and initialize parent class
+        self.start = game_state.get_agent_position(self.index)
+        CaptureAgent.register_initial_state(self, game_state)
+
+    def is_in_home_territory(self, game_state):
+        # Check if agent is in home territory based on team color
+        x = game_state.get_agent_state(self.index).get_position()[0]
+        return x <= game_state.get_walls().width // 2 if self.red else x >= game_state.get_walls().width // 2
+
+    def update_shared_state(self, game_state):
+        # Update shared game state based on current conditions
+        
+        # Check if capsule was eaten
+        if len(self.get_capsules(game_state)) == 0 and not SharedState.capsule_eaten:
+            SharedState.capsule_eaten = True
+            SharedState.retreat_counter = 64  # Set retreat timer
+
+        # Update food pellet count
+        SharedState.dots_eaten = 20 - len(self.get_food(game_state).as_list())
+        
+        # Check if scared ghost was eaten
+        my_pos = game_state.get_agent_state(self.index).get_position()
+        for enemy in [game_state.get_agent_state(i) for i in self.get_opponents(game_state)]:
+            if (enemy.scared_timer > 0 and enemy.get_position() and 
+                self.get_maze_distance(my_pos, enemy.get_position()) <= 1):
+                SharedState.scared_ghost_eaten = True
+                SharedState.retreat_counter = 34
+        
+        # Update retreat counter and defensive mode
+        SharedState.retreat_counter = max(SharedState.retreat_counter - 1, 0)
+        if SharedState.retreat_counter < 1 and SharedState.capsule_eaten and self.is_in_home_territory(game_state):
+            SharedState.in_defensive_mode = True
+
+    def should_retreat(self):
+        # Determine if agent should retreat based on game conditions
+        return (SharedState.dots_eaten >= 18 or 
+                (SharedState.capsule_eaten and SharedState.retreat_counter <= 0) or
+                (SharedState.scared_ghost_eaten and SharedState.retreat_counter <= 0))
+
+    def choose_action(self, game_state):
+        # Main decision-making method for agent actions
+        legal_actions = game_state.get_legal_actions(self.index)
+        if not legal_actions: return Directions.STOP
+
+        self.update_shared_state(game_state)
+        my_pos = game_state.get_agent_state(self.index).get_position()
+
+        # Switch to defensive mode if needed
+        if SharedState.in_defensive_mode:
+            return self.defend_action(game_state)
+            
+        # Retreat if conditions met
+        if self.should_retreat():
+            target = (12, random.randint(11,13)) if self.red else (18, random.randint(9,11))
+            path = a_star_search(SearchProblem(my_pos, target, game_state, self))
+            return path[0] if path else Directions.STOP
+            
+        # Go for capsule if available
+        if not SharedState.capsule_eaten and self.get_capsules(game_state):
+            path = a_star_search(SearchProblem(my_pos, self.get_capsules(game_state)[0], game_state, self))
+            return path[0] if path else Directions.STOP
+
+        # Hunt for food pellets
+        food = self.get_food(game_state).as_list()
+        if not food: return Directions.STOP
+
+        # Focus on north food based on team color
+        if self.red:
+            target_food = [f for f in food if f[1] > game_state.get_walls().height/2]
+        else:
+            target_food = [f for f in food if f[1] <= game_state.get_walls().height/2 - 1]
+            
+        target = min(target_food if target_food else food, key=lambda x: self.get_maze_distance(my_pos, x))
+        path = a_star_search(SearchProblem(my_pos, target, game_state, self))
+        return path[0] if path else random.choice(legal_actions)
+
+    def get_features(self, game_state, action):
+        # Calculate features for defensive behavior
+        successor = game_state.generate_successor(self.index, action)
+        features = {}
+        my_state = successor.get_agent_state(self.index)
+        my_pos = my_state.get_position()
+        enemies = [a for a in [successor.get_agent_state(i) for i in self.get_opponents(successor)]
+                  if a.is_pacman and a.get_position() is not None]
+
+        features['on_defense'] = 0 if my_state.is_pacman else 1
+        features['num_invaders'] = len(enemies)
+        features['invader_distance'] = min([self.get_maze_distance(my_pos, a.get_position()) 
+                                          for a in enemies]) if enemies else \
+                                     self.get_maze_distance(my_pos, (18, random.randint(9,11)) 
+                                                          if not self.red else (12, random.randint(11,13)))
+        features['stop'] = 1 if action == Directions.STOP else 0
+        features['reverse'] = 1 if action == Directions.REVERSE[game_state.get_agent_state(self.index).configuration.direction] else 0
+
+        return features
+
+    def get_weights(self):
+        # Define weights for defensive features
+        return {'num_invaders': -1000, 'on_defense': 100, 'invader_distance': -10, 
+                'stop': -100, 'reverse': -2}
+
+    def defend_action(self, game_state):
+        # Choose best defensive action based on features and weights
+        actions = game_state.get_legal_actions(self.index)
+        values = [sum(f * self.get_weights()[k] for k, f in self.get_features(game_state, a).items()) 
+                 for a in actions]
+        return random.choice([a for a, v in zip(actions, values) if v == max(values)])
+
+# South agent - focuses on lower half of map
+class OffensiveDefensiveAgentSOUTH(CaptureAgent):
+    # Similar to NORTH agent but with different target areas
+    # [Previous methods identical to NORTH agent]
+    def register_initial_state(self, game_state):
+        self.start = game_state.get_agent_position(self.index)
+        CaptureAgent.register_initial_state(self, game_state)
+
+    def is_in_home_territory(self, game_state):
+        x = game_state.get_agent_state(self.index).get_position()[0]
+        return x <= game_state.get_walls().width // 2 if self.red else x >= game_state.get_walls().width // 2
+
+    def update_shared_state(self, game_state):
+        if len(self.get_capsules(game_state)) == 0 and not SharedState.capsule_eaten:
+            SharedState.capsule_eaten = True
+            SharedState.retreat_counter = 64
+
+        SharedState.dots_eaten = 20 - len(self.get_food(game_state).as_list())
+        my_pos = game_state.get_agent_state(self.index).get_position()
+        for enemy in [game_state.get_agent_state(i) for i in self.get_opponents(game_state)]:
+            if (enemy.scared_timer > 0 and enemy.get_position() and 
+                self.get_maze_distance(my_pos, enemy.get_position()) <= 1):
+                SharedState.scared_ghost_eaten = True
+                SharedState.retreat_counter = 34
+                
+        SharedState.retreat_counter = max(SharedState.retreat_counter - 1, 0)
+        if SharedState.retreat_counter < 1 and SharedState.capsule_eaten and self.is_in_home_territory(game_state):
+            SharedState.in_defensive_mode = True
+
+    def should_retreat(self):
+        return (SharedState.dots_eaten >= 18 or 
+                (SharedState.capsule_eaten and SharedState.retreat_counter <= 0) or
+                (SharedState.scared_ghost_eaten and SharedState.retreat_counter <= 0))
+
+    def choose_action(self, game_state):
+        legal_actions = game_state.get_legal_actions(self.index)
+        if not legal_actions: return Directions.STOP
+
+        self.update_shared_state(game_state)
+        my_pos = game_state.get_agent_state(self.index).get_position()
+
+        # Similar logic to NORTH but with different target positions
+        if SharedState.in_defensive_mode:
+            return self.defend_action(game_state)
+        if self.should_retreat():
+            target = (13, random.randint(4,6)) if self.red else (19, random.randint(2,4))
+            path = a_star_search(SearchProblem(my_pos, target, game_state, self))
+            return path[0] if path else Directions.STOP
+
+        food = self.get_food(game_state).as_list()
+        if not food: return Directions.STOP
+        
+        # Focus on south food based on team color
+        if self.red:
+            target_food = [f for f in food if f[1] <= game_state.get_walls().height/2 - 1]
+        else:
+            target_food = [f for f in food if f[1] > game_state.get_walls().height/2]
+            
+        target = min(target_food if target_food else food, key=lambda x: self.get_maze_distance(my_pos, x))
+        path = a_star_search(SearchProblem(my_pos, target, game_state, self))
+        return path[0] if path else random.choice(legal_actions)
+
+    def get_features(self, game_state, action):
+        # Similar to NORTH but with different target positions
+        successor = game_state.generate_successor(self.index, action)
+        features = {}
+        my_state = successor.get_agent_state(self.index)
+        my_pos = my_state.get_position()
+        enemies = [a for a in [successor.get_agent_state(i) for i in self.get_opponents(successor)]
+                  if a.is_pacman and a.get_position() is not None]
+
+        features['on_defense'] = 0 if my_state.is_pacman else 1
+        features['num_invaders'] = len(enemies)
+        features['invader_distance'] = min([self.get_maze_distance(my_pos, a.get_position()) 
+                                          for a in enemies]) if enemies else \
+                                     self.get_maze_distance(my_pos, (19, random.randint(2,4)) 
+                                                          if not self.red else (13, random.randint(4,6)))
+        features['stop'] = 1 if action == Directions.STOP else 0
+        features['reverse'] = 1 if action == Directions.REVERSE[game_state.get_agent_state(self.index).configuration.direction] else 0
+
+        return features
+
+    def get_weights(self):
+        return {'num_invaders': -1000, 'on_defense': 100, 'invader_distance': -10, 
+                'stop': -100, 'reverse': -2}
+
+    def defend_action(self, game_state):
+        actions = game_state.get_legal_actions(self.index)
+        values = [sum(f * self.get_weights()[k] for k, f in self.get_features(game_state, a).items()) 
+                 for a in actions]
+        return random.choice([a for a, v in zip(actions, values) if v == max(values)])
+
+    
+##########
+# Others #
+##########
+
+# Shared state class to coordinate behavior between agents
 class SharedState:
-    retreat_counter = 0
-    capsule_eaten = False
-    dots_eaten = 0
-    scared_ghost_eaten = False
-    in_defensive_mode = False
+    retreat_counter = 0      # Countdown for retreat behavior
+    capsule_eaten = False    # Tracks if power pellet was consumed
+    dots_eaten = 0          # Count of food pellets eaten
+    scared_ghost_eaten = False  # Tracks if agent ate a scared ghost
+    in_defensive_mode = False   # Indicates if agents should switch to defense
 
     @classmethod
     def reset(cls):
+        # Reset all shared state variables at start of game
         cls.retreat_counter = 0
         cls.capsule_eaten = False
         cls.dots_eaten = 0
         cls.scared_ghost_eaten = False
         cls.in_defensive_mode = False
 
-def create_team(first_index, second_index, is_red,
-                first='OffensiveDefensiveAgentNORTH', second='OffensiveDefensiveAgentSOUTH', num_training=0):
-    SharedState.reset()
-    return [eval(first)(first_index), eval(second)(second_index)]
-
-class OffensiveDefensiveAgentNORTH(CaptureAgent):
-    """NORTH agent focused on getting capsule first"""
-    def __init__(self, index, time_for_computing=.1):
-        super().__init__(index, time_for_computing)
-        self.start = None
-        self.capsule_target = None
-
-    def register_initial_state(self, game_state):
-        self.start = game_state.get_agent_position(self.index)
-        CaptureAgent.register_initial_state(self, game_state)
-        capsules = self.get_capsules(game_state)
-        if capsules:
-            self.capsule_target = capsules[0]
-
-    def is_in_home_territory(self, game_state):
-        my_pos = game_state.get_agent_state(self.index).get_position()
-        if self.red:
-            return my_pos[0] <= game_state.get_walls().width // 2
-        else:
-            return my_pos[0] >= game_state.get_walls().width // 2
-
-    def update_shared_state(self, game_state):
-        # Check if capsule was just eaten
-        capsules = self.get_capsules(game_state)
-        if len(capsules) == 0 and not SharedState.capsule_eaten:
-            SharedState.capsule_eaten = True
-            SharedState.retreat_counter = 60
-
-        # Update dots eaten
-        food_left = len(self.get_food(game_state).as_list())
-        total_food = 20
-        SharedState.dots_eaten = total_food - food_left
-
-        # Check if we ate a scared ghost
-        my_pos = game_state.get_agent_state(self.index).get_position()
-        enemies = [game_state.get_agent_state(i) for i in self.get_opponents(game_state)]
-        
-        for enemy in enemies:
-            if enemy.scared_timer > 0 and enemy.get_position() is not None:
-                if self.get_maze_distance(my_pos, enemy.get_position()) <= 1:
-                    SharedState.scared_ghost_eaten = True
-                    SharedState.retreat_counter = 20  # Reset counter to 10 moves when we eat a ghost
-                    
-        if SharedState.retreat_counter > 0:
-            SharedState.retreat_counter -= 1
-            
-        if SharedState.capsule_eaten and self.is_in_home_territory(game_state):
-            SharedState.in_defensive_mode = True
-
-    def should_retreat(self, game_state):
-        if SharedState.dots_eaten >= 18:
-            return True
-        if SharedState.capsule_eaten and SharedState.retreat_counter <= 0:
-            return True
-        if SharedState.scared_ghost_eaten and SharedState.retreat_counter <= 0:
-            return True
-        return False
-
-    def choose_action(self, game_state):
-        legal_actions = game_state.get_legal_actions(self.index)
-        if not legal_actions:
-            return Directions.STOP
-
-        self.update_shared_state(game_state)
-
-        # If we're in defensive mode, check for invaders
-        if SharedState.in_defensive_mode:
-            enemies = [game_state.get_agent_state(i) for i in self.get_opponents(game_state)]
-            invaders = [a for a in enemies if a.is_pacman and a.get_position() is not None]
-            return self.defend_action(game_state)
-
-        # Check retreat conditions
-        if self.should_retreat(game_state):
-            return self.retreat_action(game_state)
-
-        # Always go for capsule first if not eaten
-        capsules = self.get_capsules(game_state)
-        if capsules and not SharedState.capsule_eaten:
-            return self.capsule_action(game_state)
-        
-        # After capsule eaten, help with food collection
-        return self.food_action(game_state)
-
-    def capsule_action(self, game_state):
-        legal_actions = game_state.get_legal_actions(self.index)
-        my_pos = game_state.get_agent_state(self.index).get_position()
-        capsules = self.get_capsules(game_state)
-        
-        if capsules:
-            problem = SearchProblem(my_pos, capsules[0], game_state)
-            path = a_star_search(problem)
-            
-            if path and path[0] in legal_actions:
-                return path[0]
-        return random.choice(legal_actions)
-
-    def food_action(self, game_state):
-        legal_actions = game_state.get_legal_actions(self.index)
-        my_pos = game_state.get_agent_state(self.index).get_position()
-        food = self.get_food(game_state).as_list()
-
-        if food:
-            food_distances = [(self.get_maze_distance(my_pos, food_pos), food_pos) 
-                            for food_pos in food]
-            _, closest_food = min(food_distances)
-            
-            problem = SearchProblem(my_pos, closest_food, game_state)
-            path = a_star_search(problem)
-            
-            if path and path[0] in legal_actions:
-                return path[0]
-        return random.choice(legal_actions)
-
-    def retreat_action(self, game_state):
-        legal_actions = game_state.get_legal_actions(self.index)
-        my_pos = game_state.get_agent_state(self.index).get_position()
-        
-        if self.red:
-            defensive_pos = (12, randint(11,13))
-        else:
-            defensive_pos = (18, randint(9,11))
-        
-        problem = SearchProblem(my_pos, defensive_pos, game_state)
-        path = a_star_search(problem)
-        
-        if path and path[0] in legal_actions:
-            return path[0]
-        return random.choice(legal_actions)
-    
-    def get_features(self, game_state, action):
-        features = util.Counter()
-        successor = self.get_successor(game_state, action)
-
-        my_state = successor.get_agent_state(self.index)
-        my_pos = my_state.get_position()
-
-        # Defensive positioning
-        features['on_defense'] = 1
-        if my_state.is_pacman: features['on_defense'] = 0
-        
-        # Track invaders
-        enemies = [successor.get_agent_state(i) for i in self.get_opponents(successor)]
-        invaders = [a for a in enemies if a.is_pacman and a.get_position() is not None]
-        features['num_invaders'] = len(invaders)
-        
-        # If invaders are present, minimize distance to them
-        if len(invaders) > 0:
-            dists = [self.get_maze_distance(my_pos, a.get_position()) for a in invaders]
-            features['invader_distance'] = min(dists)
-        
-        # Defensive positioning when no invaders
-        if len(invaders) == 0:
-            if not self.red:
-                dists = [self.get_maze_distance(my_pos, (18, randint(9,11)))]
-                features['invader_distance'] = min(dists)
-            else:
-                dists = [self.get_maze_distance(my_pos, (12, randint(11,13)))]
-                features['invader_distance'] = min(dists)
-        
-        # Penalize stopping or reversing
-        if action == Directions.STOP: features['stop'] = 1
-        rev = Directions.REVERSE[game_state.get_agent_state(self.index).configuration.direction]
-        if action == rev: features['reverse'] = 1
-
-        return features
-
-    def get_weights(self, game_state, action):
-        return {
-            'num_invaders': -1000, 
-            'on_defense': 100, 
-            'invader_distance': -10, 
-            'stop': -100, 
-            'reverse': -2
-        }
-
-    def evaluate(self, game_state, action):
-        features = self.get_features(game_state, action)
-        weights = self.get_weights(game_state, action)
-        return features * weights
-
-    def defend_action(self, game_state):
-        """
-        Picks among the actions with the highest Q(s,a).
-        """
-        actions = game_state.get_legal_actions(self.index)
-
-        values = [self.evaluate(game_state, a) for a in actions]
-        max_value = max(values)
-        best_actions = [a for a, v in zip(actions, values) if v == max_value]
-
-        return random.choice(best_actions)
-    
-    def get_successor(self, game_state, action):
-        """
-        Finds the next successor which is a grid position (location tuple).
-        """
-        successor = game_state.generate_successor(self.index, action)
-        pos = successor.get_agent_state(self.index).get_position()
-        if pos != nearest_point(pos):
-            # Only half a grid position was covered
-            return successor.generate_successor(self.index, action)
-        else:
-            return successor
-    def choose_action(self, game_state):
-        legal_actions = game_state.get_legal_actions(self.index)
-        if not legal_actions:
-            return Directions.STOP
-
-        self.update_shared_state(game_state)
-
-        # If we're in defensive mode and there are invaders, use defensive evaluation
-        if SharedState.in_defensive_mode:
-            enemies = [game_state.get_agent_state(i) for i in self.get_opponents(game_state)]
-            invaders = [a for a in enemies if a.is_pacman and a.get_position() is not None]
-            if len(invaders) > 0 or self.is_in_home_territory(game_state):
-                return self.defend_action(game_state)
-
-        # Continue with offensive strategy if not defending
-        if self.should_retreat(game_state):
-            return self.retreat_action(game_state)
-
-        capsules = self.get_capsules(game_state)
-        if capsules and not SharedState.capsule_eaten:
-            return self.capsule_action(game_state)
-        
-        return self.food_action(game_state)
-    
-class OffensiveDefensiveAgentSOUTH(CaptureAgent):
-    def __init__(self, index, time_for_computing=.1):
-        super().__init__(index, time_for_computing)
-        self.start = None
-        self.is_offensive_mode = True
-
-    def register_initial_state(self, game_state):
-        self.start = game_state.get_agent_position(self.index)
-        CaptureAgent.register_initial_state(self, game_state)
-
-    def is_in_home_territory(self, game_state):
-        my_pos = game_state.get_agent_state(self.index).get_position()
-        if self.red:
-            return my_pos[0] <= game_state.get_walls().width // 2
-        else:
-            return my_pos[0] >= game_state.get_walls().width // 2
-
-    def update_shared_state(self, game_state):
-        capsules = self.get_capsules(game_state)
-        if len(capsules) == 0 and not SharedState.capsule_eaten:
-            SharedState.capsule_eaten = True
-            SharedState.retreat_counter = 32
-
-        food_left = len(self.get_food(game_state).as_list())
-        total_food = 20
-        SharedState.dots_eaten = total_food - food_left
-
-        my_pos = game_state.get_agent_state(self.index).get_position()
-        enemies = [game_state.get_agent_state(i) for i in self.get_opponents(game_state)]
-        
-        for enemy in enemies:
-            if enemy.scared_timer > 0 and enemy.get_position() is not None:
-                if self.get_maze_distance(my_pos, enemy.get_position()) <= 1:
-                    SharedState.scared_ghost_eaten = True
-                    SharedState.retreat_counter = 10
-                    
-        if SharedState.retreat_counter > 0:
-            SharedState.retreat_counter -= 1
-            
-        if SharedState.capsule_eaten and self.is_in_home_territory(game_state):
-            SharedState.in_defensive_mode = True
-
-    def should_retreat(self, game_state):
-        if SharedState.dots_eaten >= 18:
-            return True
-        if SharedState.capsule_eaten and SharedState.retreat_counter <= 0:
-            return True
-        if SharedState.scared_ghost_eaten and SharedState.retreat_counter <= 0:
-            return True
-        return False
-
-    def choose_action(self, game_state):
-        legal_actions = game_state.get_legal_actions(self.index)
-        if not legal_actions:
-            return Directions.STOP
-
-        self.update_shared_state(game_state)
-
-        if SharedState.in_defensive_mode:
-            enemies = [game_state.get_agent_state(i) for i in self.get_opponents(game_state)]
-            invaders = [a for a in enemies if a.is_pacman and a.get_position() is not None]
-            return self.defend_action(game_state)
-
-        if self.should_retreat(game_state):
-            return self.retreat_action(game_state)
-
-        return self.food_action(game_state)
-
-    def food_action(self, game_state):
-        legal_actions = game_state.get_legal_actions(self.index)
-        my_pos = game_state.get_agent_state(self.index).get_position()
-        food = self.get_food(game_state).as_list()
-
-        if food:
-            food_distances = [(self.get_maze_distance(my_pos, food_pos), food_pos) 
-                            for food_pos in food]
-            _, closest_food = min(food_distances)
-            
-            problem = SearchProblem(my_pos, closest_food, game_state)
-            path = a_star_search(problem)
-            
-            if path and path[0] in legal_actions:
-                return path[0]
-        return random.choice(legal_actions)
-
-    def retreat_action(self, game_state):
-        legal_actions = game_state.get_legal_actions(self.index)
-        my_pos = game_state.get_agent_state(self.index).get_position()
-        
-        if self.red:
-            defensive_pos = (13, randint(4,6))
-        else:
-            defensive_pos = (19, randint(2,4))
-        
-        problem = SearchProblem(my_pos, defensive_pos, game_state)
-        path = a_star_search(problem)
-        
-        if path and path[0] in legal_actions:
-            return path[0]
-        return random.choice(legal_actions)
-    
-    def get_successor(self, game_state, action):
-        """
-        Finds the next successor which is a grid position (location tuple).
-        """
-        successor = game_state.generate_successor(self.index, action)
-        pos = successor.get_agent_state(self.index).get_position()
-        if pos != nearest_point(pos):
-            # Only half a grid position was covered
-            return successor.generate_successor(self.index, action)
-        else:
-            return successor
-        
-    def get_features(self, game_state, action):
-        features = util.Counter()
-        successor = self.get_successor(game_state, action)
-
-        my_state = successor.get_agent_state(self.index)
-        my_pos = my_state.get_position()
-
-        if not SharedState.in_defensive_mode:
-            # Offensive features
-            features['on_offense'] = 1
-            food_list = self.get_food(successor).as_list()
-            features['food_count'] = len(food_list)
-
-            if food_list:
-                min_dist = min([self.get_maze_distance(my_pos, food) for food in food_list])
-                features['distance_to_food'] = min_dist
-
-            enemies = [successor.get_agent_state(i) for i in self.get_opponents(successor)]
-            ghosts = [a for a in enemies if not a.is_pacman and a.get_position() is not None]
-            if ghosts:
-                dists = [self.get_maze_distance(my_pos, ghost.get_position()) for ghost in ghosts]
-                features['ghost_distance'] = min(dists)
-
-        else:
-            # Defensive features
-            features['on_defense'] = 1
-            if my_state.is_pacman: features['on_defense'] = 0
-
-            enemies = [successor.get_agent_state(i) for i in self.get_opponents(successor)]
-            invaders = [a for a in enemies if a.is_pacman and a.get_position() is not None]
-            features['num_invaders'] = len(invaders)
-
-            if len(invaders) > 0:
-                dists = [self.get_maze_distance(my_pos, a.get_position()) for a in invaders]
-                features['invader_distance'] = min(dists)
-            
-            if len(invaders) == 0:
-                if not self.red:
-                    dists = [self.get_maze_distance(my_pos, (19, randint(2,4)))]
-                    features['invader_distance'] = min(dists)
-                else:
-                    dists = [self.get_maze_distance(my_pos, (13, randint(4,6)))]
-                    features['invader_distance'] = min(dists)
-
-        if action == Directions.STOP: 
-            features['stop'] = 1
-        rev = Directions.REVERSE[game_state.get_agent_state(self.index).configuration.direction]
-        if action == rev: 
-            features['reverse'] = 1
-
-        return features
-
-    def get_weights(self, game_state, action):
-        if not SharedState.in_defensive_mode:
-            return {
-                'food_count': -100,
-                'distance_to_food': -1,
-                'ghost_distance': 2,
-                'stop': -50,
-                'reverse': -2
-            }
-        else:
-            return {
-                'num_invaders': -1000,
-                'on_defense': 100,
-                'invader_distance': -10,
-                'stop': -100,
-                'reverse': -2
-            }
-
-    def evaluate(self, game_state, action):
-        features = self.get_features(game_state, action)
-        weights = self.get_weights(game_state, action)
-        return features * weights
-
-    def defend_action(self, game_state):
-        actions = game_state.get_legal_actions(self.index)
-        values = [self.evaluate(game_state, a) for a in actions]
-        max_value = max(values)
-        best_actions = [a for a, v in zip(actions, values) if v == max_value]
-        return random.choice(best_actions)
-    
+# A* search problem implementation for pathfinding
 class SearchProblem:
-    def __init__(self, start_state, goal_state, game_state):
+    def __init__(self, start_state, goal_state, game_state, agent):
+        # Initialize search problem with start/goal states and game info
         self.start = start_state
         self.goal = goal_state
         self.game_state = game_state
         self.walls = game_state.get_walls()
+        self.agent = agent
+        self.width = game_state.get_walls().width
+        self.height = game_state.get_walls().height
 
     def get_start_state(self):
         return self.start
@@ -484,40 +293,50 @@ class SearchProblem:
 
     def get_successors(self, state):
         successors = []
+        x, y = state
+
         for action in [Directions.NORTH, Directions.SOUTH, Directions.EAST, Directions.WEST]:
-            x, y = state
             dx, dy = Actions.direction_to_vector(action)
             next_x, next_y = int(x + dx), int(y + dy)
             
-            if not self.walls[next_x][next_y]:
+            if 0 <= next_x < self.width and 0 <= next_y < self.height and not self.walls[next_x][next_y]:
                 next_state = (next_x, next_y)
-                successors.append((next_state, action, 1))
+                enemies = [self.game_state.get_agent_state(i) for i in self.agent.get_opponents(self.game_state)]
+                
+                # Check for nearby non-scared ghosts
+                if not any(not a.is_pacman and a.get_position() and a.scared_timer <= 0 and
+                        self.agent.get_maze_distance(next_state, a.get_position()) <= 2 
+                        for a in enemies):
+                    successors.append((next_state, action, 1))
+
         return successors
 
-def a_star_search(problem, heuristic=None):
-    if heuristic is None:
-        def heuristic(state, problem):
-            goal = problem.goal
-            return abs(state[0] - goal[0]) + abs(state[1] - goal[1])
 
-    pq = util.PriorityQueue()
-    start_state = problem.get_start_state()
-    pq.push((start_state, [], 0), heuristic(start_state, problem))
-    visited = set()
+# A* search implementation for pathfinding
+def a_star_search(problem):
+    # Initialize priority queue with start state
+    pq = PriorityQueue()
+    start = problem.get_start_state()
+    # Store state, path, and cost; prioritize by f(n) = g(n) + h(n)
+    pq.push((start, [], 0), abs(start[0] - problem.goal[0]) + abs(start[1] - problem.goal[1]))
+    visited = {start}  # Track visited states
 
     while not pq.is_empty():
         state, path, cost = pq.pop()
+        # Return path if goal reached
+        if problem.is_goal_state(state):
+            return path if path else [Directions.STOP]
 
-        if state not in visited:
-            visited.add(state)
-
-            if problem.is_goal_state(state):
-                return path
-
-            for next_state, action, step_cost in problem.get_successors(state):
-                if next_state not in visited:
-                    new_path = path + [action]
-                    new_cost = cost + step_cost
-                    priority = new_cost + heuristic(next_state, problem)
-                    pq.push((next_state, new_path, new_cost), priority)
-    return []
+        # Explore successors
+        for next_state, action, step_cost in problem.get_successors(state):
+            if next_state not in visited:
+                visited.add(next_state)
+                new_path = path + [action]
+                new_cost = cost + step_cost
+                # Calculate Manhattan distance heuristic
+                h = abs(next_state[0] - problem.goal[0]) + abs(next_state[1] - problem.goal[1])
+                # Push with f(n) = g(n) + h(n) priority
+                pq.push((next_state, new_path, new_cost), new_cost + h)
+    
+    # Return STOP if no path found
+    return [Directions.STOP]
